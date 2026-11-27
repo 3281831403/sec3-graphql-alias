@@ -425,13 +425,13 @@ def field_weight(field: Any, policy: Mapping[str, Any] | None) -> int:
     policy = policy or {}
     if name.startswith("__"):
         return _amount(policy.get("introspection_weight"), 3)
-    return _amount(policy.get("default_weight"), 1)
+    weights = policy.get("field_weights")
+    if not isinstance(weights, Mapping):
+        weights = {}
+    return _amount(weights.get(name, policy.get("default_weight")), 1)
 
 
 def _cost_weight(field: Mapping[str, Any], policy: Mapping[str, Any]) -> int:
-    name = _field_name(field)
-    if name.startswith("__"):
-        return _amount(policy.get("default_weight"), 1)
     return field_weight(field, policy)
 
 
@@ -516,29 +516,33 @@ def _cost_selection(
     policy: Mapping[str, Any],
     stack: tuple[str, ...],
 ) -> int:
-    costs: list[int] = []
-    seen: set[str] = set()
+    total = 0
     for node in selection:
         kind = node.get("kind")
         if kind == "field":
-            name = _field_name(node)
-            if name in seen:
-                continue
-            seen.add(name)
-            weight = _cost_weight(node, policy)
-            child = _cost_selection(
+            # Every occurrence is a separate resolver invocation, so aliased
+            # copies of the same field are metered separately rather than
+            # de-duplicated.  The explicit alias itself adds a surcharge.
+            cost = _cost_weight(node, policy)
+            if node.get("alias") is not None:
+                cost += _amount(policy.get("alias_weight"), 1)
+            total += cost + _cost_selection(
                 node.get("selection") or [], fragments, policy, stack
             )
-            costs.append(weight + child)
         elif kind == "inline_fragment":
-            costs.append(
-                _cost_selection(
-                    node.get("selection") or [], fragments, policy, stack
-                )
+            total += _cost_selection(
+                node.get("selection") or [], fragments, policy, stack
             )
         elif kind == "spread":
-            continue
-    return max(costs) if costs else 0
+            name = node.get("name")
+            fragment = _fragment(fragments, name, stack)
+            total += _cost_selection(
+                fragment.get("selection") or [],
+                fragments,
+                policy,
+                stack + (name,),
+            )
+    return total
 
 
 def cost_of(ast: Mapping[str, Any], policy: Mapping[str, Any] | None) -> int:
@@ -566,7 +570,7 @@ def check_alias_limit(
 
     policy = policy or {}
     limit = policy.get("max_aliases")
-    if limit is None or not policy.get("strict_aliases", False):
+    if limit is None:
         return True
     return len(collect_aliases(ast)) <= _amount(limit, 0)
 
@@ -577,12 +581,17 @@ def check_cost(ast: Mapping[str, Any], policy: Mapping[str, Any] | None) -> bool
     policy = policy or {}
     limit = policy.get("max_cost")
     if limit is None:
-        return True
+        return False
     return cost_of(ast, policy) <= _amount(limit, 0)
 
 
 def _policy_issues(policy: Mapping[str, Any]) -> list[str]:
     issues: list[str] = []
+    cost = policy.get("max_cost")
+    if cost is None:
+        issues.append("policy max_cost is required")
+    elif isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
+        issues.append("policy max_cost must be a non-negative integer")
     aliases = policy.get("max_aliases")
     if aliases is not None:
         if isinstance(aliases, bool) or not isinstance(aliases, int) or aliases < 0:
@@ -606,8 +615,6 @@ def enforce(
     if not check_alias_limit(ast, policy):
         problems.append("alias limit exceeded")
     if not check_cost(ast, policy):
-        if policy.get("degrade_on_limit", True):
-            return problems
         problems.append("cost limit exceeded")
     return problems
 
@@ -624,13 +631,11 @@ def cost_batch(
     costs: list[int] = []
     allowed: list[bool] = []
     errors: list[list[str]] = []
-    cached_cost: int | None = None
     for text in queries:
         ast = parse_query(text)
-        if cached_cost is None:
-            cached_cost = cost_of(ast, policy)
+        cost = cost_of(ast, policy)
         issues = enforce(ast, policy)
-        costs.append(cached_cost)
+        costs.append(cost)
         allowed.append(not issues)
         errors.append(issues)
     return {"costs": costs, "allowed": allowed, "errors": errors}
